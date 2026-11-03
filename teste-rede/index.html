@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>SmashPong · Teste de rede</title>
+<style>
+:root{--bg:#1b1430;--chip:rgba(10,6,24,.72);--tx:#f4f7fb;--ac:#ffd34d;--ok:#5be38a;--bad:#ff6b6b}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:15px system-ui,sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+#cv{position:fixed;inset:0;width:100%;height:100%;display:block}
+.chip{background:var(--chip);border-radius:10px;padding:6px 10px}
+#hud{position:fixed;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:8px;align-items:center;font-size:13px;white-space:nowrap}
+#score{font-size:22px;font-weight:800;letter-spacing:1px}
+#net b{color:var(--ac)}
+#tools{position:fixed;bottom:8px;left:8px;display:flex;gap:6px;flex-wrap:wrap;font-size:13px}
+#tools button,#tools select,.btn{font:inherit;color:var(--tx);background:#3a2c66;border:0;border-radius:9px;padding:7px 11px}
+#lobby{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--bg);z-index:5;text-align:center;padding:16px}
+#lobby h1{margin:0;font-size:24px;color:var(--ac)}
+#lobby p{margin:0;max-width:520px;opacity:.85;line-height:1.35}
+#lobby input{font:700 22px system-ui;width:120px;text-align:center;border-radius:10px;border:0;padding:8px;letter-spacing:4px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center}
+.btn{font-size:17px;padding:10px 18px;background:#e2463f;font-weight:700}
+.btn.alt{background:#3a2c66}
+#st{min-height:20px;color:var(--ac)}
+#rep{position:fixed;inset:10% 8%;background:#120c22;border-radius:14px;padding:14px;z-index:6;display:none;flex-direction:column;gap:8px}
+#rep textarea{flex:1;font:13px monospace;background:#000;color:#ddd;border-radius:8px;border:0;padding:8px}
+.hidden{display:none!important}
+</style></head><body>
+<canvas id="cv"></canvas>
+<div id="hud" class="hidden"><span class="chip" id="score">0 × 0</span><span class="chip" id="net">…</span></div>
+<div id="tools" class="hidden">
+  <select id="delay" title="Atraso extra nas suas mensagens">
+    <option value="0">Atraso extra: 0</option><option value="50">+50 ms</option><option value="100">+100 ms</option><option value="200">+200 ms</option><option value="300">+300 ms</option>
+  </select>
+  <button id="holdB">Segurar bola: sim</button>
+  <button id="repB">Relatório</button>
+</div>
+<div id="lobby">
+  <h1>Teste de rede do SmashPong</h1>
+  <p>Abra esta página em dois aparelhos (de preferência um no 4G e outro no Wi-Fi). Um cria a sala e o outro entra com o código.</p>
+  <div class="row"><button class="btn" id="mk">Criar sala</button></div>
+  <div class="row"><input id="code" inputmode="numeric" maxlength="4" placeholder="0000"><button class="btn alt" id="join">Entrar</button></div>
+  <div id="st"></div>
+</div>
+<div id="rep"><b>Relatório (copie e mande)</b><textarea id="repT" readonly></textarea><div class="row"><button class="btn alt" id="repC">Copiar</button><button class="btn alt" id="repX">Fechar</button></div></div>
+<script>
+(function(){
+'use strict';
+/* ===== Protótipo de latência (16.12): uma mensagem por batida =====
+   Cada lado simula a mesma bola a partir da última batida (posição, velocidade e instante no relógio comum).
+   Quem recebe a bola é o juiz da jogada (acerto, erro, fora). A batida do outro chega atrasada: a bola é
+   segurada perto da raquete dele e depois alcança o tempo certo acelerando um pouco, antes de chegar em você. */
+const $=id=>document.getElementById(id);
+const HASH=location.hash;
+const LOCAL=/local/.test(HASH), BOT=/bot/.test(HASH);
+const TL=1.37, TY=.76, NET=.1525, BR=.02, G=9.8, E=.88, DT=1/500;
+
+/* ---------- relógio comum (o do anfitrião) ---------- */
+const NOW=()=>performance.now()/1000;
+let OFF=0; const SYNC=[];           /* amostras {rtt,off} */
+const T=()=>NOW()+OFF;              /* tempo comum em segundos */
+
+/* ---------- estado ---------- */
+let ME=0, OPP=0, ROLE='';           /* lado: +1 anfitrião (direita do mundo), -1 convidado */
+const ST={score:{'1':0,'-1':0}, rally:0, server:1, phase:'wait', srvAt:0};
+let TRAJ=null;                      /* {t,x,y,vx,vy,by,n} by = lado de quem bateu */
+let HITN=0;                         /* número da última batida aplicada */
+let DEBT=0, DEBT0=0, DEBT_T0=0, DEBT_DUR=.3;  /* atraso exibido da bola (s) e como ele some */
+let HOLD=true, holdS=0;             /* segurando a bola perto da raquete do outro */
+let VOFF={x:0,y:0};                 /* deslocamento visual que some (troca de trajetória) */
+let EXTRA=0;                        /* atraso artificial (ms) */
+const PAD={x:1.6,y:1.05,tx:1.6,ty:1.05,vx:0,vy:0};
+const OPAD={buf:[],x:-1.6,y:1.05};
+const STATS={rtt:[],lat:[],hold:[],jump:[],hits:0,pts:0,via:'-',t0:0};
+let RES=null; const LOG=[]; const lg=s=>{ LOG.push((T()).toFixed(2)+' '+s); if(LOG.length>200) LOG.shift(); };                       /* resultado da jogada atual já decidido */
+
+/* ---------- física determinística ---------- */
+function sim(tr,dt){ /* devolve {x,y,vx,vy,b:[{t,x,side}],net} dt em s depois da batida */
+  let x=tr.x,y=tr.y,vx=tr.vx,vy=tr.vy,t=0; const b=[]; let net=false;
+  const n=Math.max(0,Math.min(6000,Math.floor(dt/DT)));
+  for(let i=0;i<n;i++){
+    const px=x,py=y; vy-=G*DT; x+=vx*DT; y+=vy*DT; t+=DT;
+    if(!net && px*x<=0 && px!==x && y<TY+NET+BR && y>TY-.05){ net=true; vx=-vx*.15; x=px; }
+    if(vy<0 && py>=TY+BR && y<TY+BR && Math.abs(x)<=TL){ y=TY+BR+(TY+BR-y); vy=-vy*E; vx*=.97; b.push({t,x,side:Math.sign(x)||1}); }
+    if(y<BR){ y=BR; vy=Math.abs(vy)*.5; vx*=.8; }
+  }
+  return {x,y,vx,vy,b,net};
+}
+
+/* ---------- rede ---------- */
+let SEND=()=>{};
+function send(o){ const f=()=>SEND(o); if(EXTRA>0) setTimeout(f,EXTRA); else f(); }
+
+function onMsg(m){
+  if(!m||!m.type) return;
+  if(m.type==='ping'){ send({type:'pong',t0:m.t0,th:NOW()}); if(m.rtt) pushRtt(m.rtt); return; }
+  if(m.type==='pong'){ const t2=NOW(), rtt=t2-m.t0; SYNC.push({rtt,off:m.th-(m.t0+t2)/2}); if(SYNC.length>20) SYNC.shift();
+    let best=SYNC[0]; for(const s of SYNC) if(s.rtt<best.rtt) best=s; OFF=best.off; pushRtt(rtt); LASTRTT=rtt; return; }
+  if(m.type==='pad'){ OPAD.buf.push(m); if(OPAD.buf.length>40) OPAD.buf.shift(); return; }
+  if(m.type==='hit'){ if(m.n<=HITN) return; remoteHit(m); return; }
+  if(m.type==='pt'){ if(m.r<ST.rally) return; applyPoint(m.w,m.r,m.s); return; }
+  if(m.type==='hello'&&ROLE==='host'){ startGame(); return; }
+}
+let LASTRTT=0;
+function pushRtt(r){ STATS.rtt.push(r*1000); if(STATS.rtt.length>400) STATS.rtt.shift(); }
+
+/* transporte local (teste em abas do mesmo navegador) */
+function localNet(code){ const bc=new BroadcastChannel('smlat-'+code); const me=ROLE;
+  bc.onmessage=e=>{ if(e.data.to===me){ const d=+(/lag=(\d+)/.exec(HASH)||[0,0])[1]; d?setTimeout(()=>onMsg(e.data.m),d):onMsg(e.data.m); } };
+  SEND=o=>bc.postMessage({to:me==='host'?'guest':'host',m:o}); STATS.via='local'; ready(); }
+
+/* MQTT 3.1.1 mínimo (o mesmo do duelo) */
+function mqttOpen(url,id,on){ const enc=new TextEncoder(), dec=new TextDecoder();
+  const str=s=>{ const b=enc.encode(s); return [b.length>>8,b.length&255,...b]; }, rl=n=>{ const o=[]; do{ let d=n%128; n=Math.floor(n/128); if(n) d|=128; o.push(d); }while(n); return o; };
+  const pkt=(t,body)=>new Uint8Array([t,...rl(body.length),...body]), topic=t=>'smashpong/lat/'+t;
+  const S={ws:null,ok:false,closed:false};
+  let ws; try{ ws=new WebSocket(url,['mqtt']); }catch(_){ on.dead&&on.dead(); return {send(){},ok:()=>false}; }
+  ws.binaryType='arraybuffer'; S.ws=ws; let buf=new Uint8Array(0);
+  ws.onopen=()=>ws.send(pkt(0x10,[...str('MQTT'),4,2,0,30,...str('sl'+Math.random().toString(36).slice(2,12))]));
+  ws.onmessage=e=>{ const nb=new Uint8Array(e.data), b=new Uint8Array(buf.length+nb.length); b.set(buf); b.set(nb,buf.length); buf=b;
+    while(buf.length>=2){ let mul=1,n=0,j=1,d; do{ if(j>=buf.length) return; d=buf[j++]; n+=(d&127)*mul; mul*=128; }while(d&128); if(buf.length<j+n) return;
+      const t=buf[0], body=buf.slice(j,j+n), k=t>>4; buf=buf.slice(j+n);
+      if(k===2){ if(body[1]!==0){ try{ws.close();}catch(_){} return on.dead&&on.dead(); } ws.send(pkt(0x82,[0,1,...str(topic(id)),0])); }
+      else if(k===9){ S.ok=true; setInterval(()=>{ try{ ws.send(new Uint8Array([0xC0,0])); }catch(_){} },20000); on.open(); }
+      else if(k===3){ const tl=(body[0]<<8)|body[1], off=2+tl+(((t>>1)&3)?2:0); let m; try{ m=JSON.parse(dec.decode(body.slice(off))); }catch(_){ continue; } on.msg(m); } } };
+  ws.onclose=()=>{ S.ok=false; on.dead&&on.dead(); };
+  return { send(dst,o){ if(S.ok&&ws.readyState===1) ws.send(pkt(0x30,[...str(topic(dst)),...enc.encode(JSON.stringify(o))])); }, ok:()=>S.ok };
+}
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun.cloudflare.com:3478']},{urls:'turn:eu-0.turn.peerjs.com:3478',username:'peerjs',credential:'peerjsp'},{urls:'turn:us-0.turn.peerjs.com:3478',username:'peerjs',credential:'peerjsp'}];
+
+function onlineNet(code){
+  const me='sl'+code+(ROLE==='host'?'h':'g'), other='sl'+code+(ROLE==='host'?'g':'h');
+  const seen=new Set(); let mq=[], rtcOk=false, pc=null, relayOn=false;
+  const sig=o=>{ o.k=Math.random().toString(36).slice(2,10); mq.forEach(c=>c.send(other,o)); };
+  const gotSig=async m=>{ if(m.k){ if(seen.has(m.k)) return; seen.add(m.k); }
+    if(m.relay){ onMsg(m.relay); return; }
+    if(m.type==='hi'&&ROLE==='host'){ if(pc) return; makePc(true); }
+    else if(m.type==='sdp'){ if(!pc) makePc(false); await pc.setRemoteDescription(m.sdp);
+      if(m.sdp.type==='offer'){ await pc.setLocalDescription(await pc.createAnswer()); await gathered(); sig({type:'sdp',sdp:pc.localDescription}); } } };
+  const gathered=()=>new Promise(r=>{ if(pc.iceGatheringState==='complete') return r(); const to=setTimeout(r,2500); pc.addEventListener('icegatheringstatechange',()=>{ if(pc.iceGatheringState==='complete'){ clearTimeout(to); r(); } }); });
+  const CH={};  /* 'rel' confiável (batidas, pontos, relógio) e 'fast' sem reenvio (posição da raquete) */
+  function wire(c){ c.onopen=()=>{ CH[c.label]=c; if(rtcOk||!CH.rel||!CH.fast) return; rtcOk=true;
+      SEND=o=>{ const k=o.type==='pad'?CH.fast:CH.rel; try{ k.send(JSON.stringify(o)); }catch(_){} }; viaCheck(); ready(); };
+    c.onmessage=e=>{ let m; try{ m=JSON.parse(e.data); }catch(_){ return; } onMsg(m); }; }
+  function makePc(host){ pc=new RTCPeerConnection({iceServers:ICE});
+    if(host){ wire(pc.createDataChannel('rel',{ordered:true})); wire(pc.createDataChannel('fast',{ordered:false,maxRetransmits:0})); pc.createOffer().then(o=>pc.setLocalDescription(o)).then(gathered).then(()=>sig({type:'sdp',sdp:pc.localDescription})); }
+    else pc.ondatachannel=e=>wire(e.channel); }
+  async function viaCheck(){ try{ const s=await pc.getStats(); let pair=null; s.forEach(r=>{ if(r.type==='transport'&&r.selectedCandidatePairId) pair=s.get(r.selectedCandidatePairId); });
+      if(!pair) s.forEach(r=>{ if(r.type==='candidate-pair'&&r.nominated&&r.state==='succeeded') pair=r; });
+      const lc=pair&&s.get(pair.localCandidateId), rc=pair&&s.get(pair.remoteCandidateId);
+      STATS.via=(lc&&lc.candidateType==='relay')||(rc&&rc.candidateType==='relay')?'retransmissão (TURN)':'direto (P2P)'; }catch(_){ STATS.via='direto?'; } }
+  let opened=0;
+  if(/sigbc/.test(HASH)){ /* teste: sinalização por BroadcastChannel, conexão WebRTC de verdade */
+    const bc=new BroadcastChannel('sigbc'+code); bc.onmessage=e=>{ if(e.data.dst===me) gotSig(e.data.o); };
+    mq.push({send:(dst,o)=>bc.postMessage({dst,o:JSON.parse(JSON.stringify(o))})}); setTimeout(()=>{ opened=1; if(ROLE==='guest') hiLoop(); },50); }
+  else BROKERS.forEach(u=>{ const c=mqttOpen(u,me,{open(){ if(++opened===1){ stMsg(ROLE==='host'?'Sala '+code+' criada. Esperando o outro aparelho…':'Procurando a sala '+code+'…'); if(ROLE==='guest') hiLoop(); } },msg:gotSig}); mq.push(c); });
+  function hiLoop(){ let n=0; const iv=setInterval(()=>{ if(rtcOk||relayOn||n++>40){ clearInterval(iv); return; } sig({type:'hi'}); },700); }
+  setTimeout(()=>{ if(rtcOk) return; relayOn=true; STATS.via='servidor MQTT (sem P2P)';
+    SEND=o=>sig({relay:o}); stMsg('Conexão direta falhou; usando o servidor.'); if(ROLE==='guest') send({type:'hello'}); ready(); },15000);
+  setTimeout(()=>{ if(!opened) stMsg('Não consegui falar com os servidores. Verifique a internet.'); },8000);
+}
+
+/* ---------- jogo ---------- */
+let READY=false;
+function ready(){ if(READY) return; READY=true; $('lobby').classList.add('hidden'); $('hud').classList.remove('hidden'); $('tools').classList.remove('hidden');
+  STATS.t0=NOW(); setInterval(()=>{ if(ROLE==='guest') send({type:'ping',t0:NOW(),rtt:LASTRTT}); },ROLE==='guest'?500:1e9);
+  if(ROLE==='host'){ setInterval(()=>{},1000); } else { setTimeout(()=>send({type:'hello'}),900); } }
+function startGame(){ if(ST.phase!=='wait') return; ST.phase='serve'; ST.srvAt=T()+1.5; }
+function stMsg(s){ $('st').textContent=s; }
+
+function remoteHit(m){
+  const now=T(), lat=Math.max(0,now-m.t);
+  /* onde a bola estava sendo mostrada antes */
+  const before=ballDisp(now);
+  HITN=m.n; TRAJ={t:m.t,x:m.x,y:m.y,vx:m.vx,vy:m.vy,by:m.by,n:m.n}; RES=null;
+  ST.phase='play';
+  const flight=Math.abs(m.x)/Math.max(1,Math.abs(m.vx));      /* tempo até a rede */
+  if(HOLD){ DEBT=lat; DEBT0=lat; DEBT_T0=now; DEBT_DUR=Math.max(.12,flight*.85+.1); }
+  else { DEBT=0; DEBT0=0; }
+  const after=ballDisp(now);
+  if(before){ VOFF.x=before.x-after.x; VOFF.y=before.y-after.y; STATS.jump.push(Math.hypot(VOFF.x,VOFF.y)*100); }
+  lg('hit remoto n='+m.n+' lat='+(lat*1000|0)+' x='+m.x.toFixed(2)+' vx='+m.vx.toFixed(2)); STATS.lat.push(lat*1000); STATS.hold.push(holdS*1000); holdS=0; STATS.hits++;
+}
+function localHit(b){
+  const dir=-ME, pvx=PAD.vx*dir, pvy=PAD.vy;
+  let sp=Math.max(4,Math.min(8.5,4.8+.35*pvx));
+  const tx=dir*Math.max(.35,Math.min(1.25,.85+.07*pvx-.12*pvy));
+  let vy=0;
+  for(let k=0;k<12;k++){ const d=Math.abs(tx-b.x), Tt=d/sp; vy=((TY+BR)-b.y+.5*G*Tt*Tt)/Tt;
+    const tn=Math.abs(b.x)/sp, yn=b.y+vy*tn-.5*G*tn*tn; if(yn>TY+NET+BR+.04) break; sp*=.92; }
+  const now=T(); HITN++; const m={type:'hit',n:HITN,t:now,x:b.x,y:b.y,vx:dir*sp,vy,by:ME};
+  TRAJ={t:m.t,x:m.x,y:m.y,vx:m.vx,vy:m.vy,by:ME,n:HITN}; DEBT=0; DEBT0=0; holdS=0; VOFF={x:0,y:0}; RES=null; STATS.hits++;
+  if(ST.phase==='serve') ST.phase='play';
+  send(m); hitSnd();
+}
+function serveNow(){ const b={x:ME*1.35,y:1.0}; PAD.vx=-ME*2; PAD.vy=0; localHit(b); }
+
+function ballDisp(now){ if(!TRAJ) return null; let d=DEBT; return sim(TRAJ,Math.max(0,now-d-TRAJ.t)); }
+
+/* juiz: quem recebe a bola decide */
+function judge(now){
+  if(!TRAJ||RES||ST.phase!=='play') return;
+  const to=-TRAJ.by; if(to!==ME) return;
+  const s=sim(TRAJ,Math.max(0,now-DEBT-TRAJ.t));
+  const onMine=s.b.filter(q=>q.side===ME), onTheirs=s.b.filter(q=>q.side===TRAJ.by&&q.t>.02);
+  let w=0;
+  if(s.net&&Math.abs(s.vx)<1.5&&s.y<TY+.05) w=ME;
+  else if(onTheirs.length) w=ME;                         /* caiu do lado de quem bateu */
+  else if(!onMine.length&&((s.y<TY-.05&&s.vy<0)||(s.x*ME>TL+.4&&s.vx*ME>0))) w=ME;  /* passou do fim da mesa sem quicar */  /* fora */
+  else if(onMine.length>=2) w=TRAJ.by;                   /* quicou duas vezes do meu lado */
+  else if(onMine.length&&(s.y<.15||Math.abs(s.x)>TL+1.6)) w=TRAJ.by;
+  if(w){ lg('juiz w='+w+' x='+s.x.toFixed(2)+' y='+s.y.toFixed(2)+' meus='+onMine.length+' deles='+onTheirs.length+' rede='+s.net+' pad='+PAD.x.toFixed(2)+','+PAD.y.toFixed(2)); RES=w; const sc=Object.assign({},ST.score); sc[w]++; send({type:'pt',w,r:ST.rally,s:sc}); applyPoint(w,ST.rally,sc); }
+}
+function applyPoint(w,r,sc){ if(r<ST.rally) return; ST.rally=r+1; ST.score=sc; RES=w; STATS.pts++; holdS=0;
+  const tot=sc['1']+sc['-1']; ST.server=(Math.floor(tot/2)%2===0)?1:-1; ST.phase='serve'; ST.srvAt=T()+1.4; ptSnd(w===ME); }
+
+/* ---------- desenho ---------- */
+const cv=$('cv'), cx=cv.getContext('2d'); let W=0,H=0,S=1,OXX=0,OYY=0,DPR=1;
+function resize(){ DPR=Math.min(2,devicePixelRatio||1); W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; cx.setTransform(DPR,0,0,DPR,0,0);
+  S=Math.min(W/4.6,H/2.6); OXX=W/2; OYY=H-Math.max(20,H*.06); }
+addEventListener('resize',resize); resize();
+const sx=x=>OXX+x*ME*S, sy=y=>OYY-y*S, wx=X=>(X-OXX)/S*ME, wy=Y=>(OYY-Y)/S;
+
+function draw(now){
+  cx.fillStyle='#1b1430'; cx.fillRect(0,0,W,H);
+  cx.fillStyle='#2a2046'; cx.fillRect(0,sy(.35),W,H);
+  /* mesa */
+  cx.fillStyle='#1d6f5a'; cx.fillRect(sx(-TL*ME),sy(TY),TL*2*S,.05*S);
+  cx.fillStyle='#f4f7fb'; cx.fillRect(sx(-TL*ME),sy(TY)-2,TL*2*S,3);
+  cx.fillStyle='#3b2f44'; cx.fillRect(sx(-1.1*ME)-4,sy(TY),8,TY*S); cx.fillRect(sx(1.1*ME)-4,sy(TY),8,TY*S);
+  cx.fillStyle='#e8e8f0'; cx.fillRect(OXX-2,sy(TY+NET),4,NET*S);
+  /* raquetes */
+  const op=oppPad(now);
+  pad(op.x,op.y,'#5aa0ff'); pad(PAD.x,PAD.y,'#e2463f');
+  /* bola */
+  let b=null;
+  if(ST.phase==='serve'){ b=ST.server===ME?{x:PAD.x-ME*.12,y:PAD.y+.1}:{x:op.x+ME*.12,y:op.y+.1}; }
+  else if(TRAJ){ b=ballDisp(now); }
+  if(b){ const X=sx(b.x+VOFF.x), Y=sy(b.y+VOFF.y);
+    cx.fillStyle='rgba(0,0,0,.35)'; cx.beginPath(); cx.ellipse(X,sy(b.y>TY&&Math.abs(b.x)<TL?TY:0),6,2,0,0,7); cx.fill();
+    cx.fillStyle='#fff6e6'; cx.beginPath(); cx.arc(X,Y,Math.max(5,BR*S*1.6),0,7); cx.fill(); }
+  if(ST.phase==='wait'){ txt('Esperando o outro jogador…',W/2,H*.35); }
+  else if(ST.phase==='serve'&&ST.server===ME){ txt('Seu saque',W/2,H*.3); }
+}
+function pad(x,y,c){ cx.fillStyle=c; cx.beginPath(); cx.ellipse(sx(x),sy(y),.09*S,.11*S,0,0,7); cx.fill(); cx.fillStyle='#4a2f22'; cx.fillRect(sx(x)-3,sy(y)+.1*S,6,.12*S); }
+function txt(s,x,y){ cx.font='700 18px system-ui'; cx.textAlign='center'; cx.fillStyle='#f4f7fb'; cx.fillText(s,x,y); }
+
+function oppPad(now){ const tt=now-.12, b=OPAD.buf; if(!b.length) return {x:-ME*1.6,y:1.05};
+  for(let i=b.length-1;i>0;i--){ if(b[i-1].t<=tt){ const a=b[i-1],c=b[i],k=Math.max(0,Math.min(1,(tt-a.t)/Math.max(.001,c.t-a.t))); return {x:a.x+(c.x-a.x)*k,y:a.y+(c.y-a.y)*k}; } }
+  return b[b.length-1]; }
+
+/* ---------- entrada ---------- */
+cv.addEventListener('pointerdown',e=>{ aud(); setT(e); }); cv.addEventListener('pointermove',e=>{ if(e.buttons||e.pointerType==='mouse') setT(e); });
+function setT(e){ PAD.tx=wx(e.clientX); PAD.ty=wy(e.clientY-50); }
+
+/* ---------- laço ---------- */
+let last=NOW(), padSent=0;
+function loop(){
+  const t=NOW(), dt=Math.min(.05,t-last); last=t; const now=T();
+  if(BOT) botMove(now);
+  const minX=.25, maxX=2.3; PAD.tx=Math.max(minX,Math.min(maxX,PAD.tx*ME))*ME; PAD.ty=Math.max(.8,Math.min(2.1,PAD.ty));
+  const k=1-Math.exp(-dt*28), nx=PAD.x+(PAD.tx-PAD.x)*k, ny=PAD.y+(PAD.ty-PAD.y)*k;
+  PAD.vx=dt>0?(nx-PAD.x)/dt:0; PAD.vy=dt>0?(ny-PAD.y)/dt:0; PAD.x=nx; PAD.y=ny;
+  if(READY&&now-padSent>.033){ padSent=now; send({type:'pad',t:now,x:+PAD.x.toFixed(3),y:+PAD.y.toFixed(3)}); }
+  /* atraso exibido: cresce segurando, some alcançando */
+  if(TRAJ&&TRAJ.by===ME&&ST.phase==='play'&&HOLD){
+    const s=ballDisp(now), op=oppPad(now);
+    const bounced=s.b.some(q=>q.side===OPP);
+    if(bounced&&DEBT<.45){ const k=s.x*OPP>=Math.abs(op.x)-.22?1:.6; DEBT+=dt*k; holdS+=dt*k; }  /* depois do quique do lado dele a bola desacelera; perto da raquete dele para */
+  } else if(DEBT>0&&DEBT0>0){ DEBT=DEBT0*Math.max(0,1-(now-DEBT_T0)/DEBT_DUR); if(DEBT<=0) DEBT0=0; }
+  VOFF.x*=Math.exp(-dt/.08); VOFF.y*=Math.exp(-dt/.08);
+  /* minha batida */
+  if(TRAJ&&ST.phase==='play'&&TRAJ.by===OPP&&!RES){
+    const b=ballDisp(now); if(b&&b.b.some(q=>q.side===ME)&&Math.hypot(b.x-PAD.x,b.y-PAD.y)<.17) localHit(b); }
+  if(ST.phase==='serve'&&ST.server===ME&&now>=ST.srvAt&&READY) serveNow();
+  judge(now);
+  draw(now); hud();
+  requestAnimationFrame(loop);
+}
+function botMove(now){ if(ST.phase==='play'&&TRAJ&&TRAJ.by===OPP){ const b=TRAJ&&sim(TRAJ,Math.max(0,now+.06-DEBT-TRAJ.t)); if(b){ PAD.tx=b.x+ME*.03; PAD.ty=b.y; } } else { PAD.tx=ME*1.6; PAD.ty=1.05; } }
+
+/* ---------- painel ---------- */
+const med=a=>{ if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); return s[Math.floor(s.length/2)]; };
+const p95=a=>{ if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); return s[Math.floor(s.length*.95)]; };
+function hud(){ $('score').textContent=ST.score[ME]+' × '+ST.score[OPP];
+  const r=STATS.rtt.slice(-20), l=STATS.lat.slice(-10);
+  $('net').innerHTML='Ping <b>'+Math.round(med(r))+' ms</b> · batida chega em <b>'+Math.round(med(l))+' ms</b> · '+STATS.via+(EXTRA?' · +'+EXTRA:''); }
+function report(){ const r=STATS.rtt, l=STATS.lat;
+  return ['SmashPong teste de rede (16.12)', 'papel: '+(ROLE==='host'?'anfitrião':'convidado')+' · via: '+STATS.via,
+   'tempo: '+Math.round(NOW()-STATS.t0)+' s · batidas: '+STATS.hits+' · pontos: '+STATS.pts+' · placar '+ST.score[ME]+'×'+ST.score[OPP],
+   'ping (ida e volta) ms: mediana '+Math.round(med(r))+' · p95 '+Math.round(p95(r))+' · min '+Math.round(Math.min(...r,9e9)%9e9),
+   'batida do outro chega em ms: mediana '+Math.round(med(l))+' · p95 '+Math.round(p95(l)),
+   'bola segurada ms: mediana '+Math.round(med(STATS.hold))+' · salto visual cm: mediana '+Math.round(med(STATS.jump))+' · p95 '+Math.round(p95(STATS.jump)),
+   'atraso extra: '+EXTRA+' ms · segurar bola: '+(HOLD?'sim':'não'), navigator.userAgent].join('\n'); }
+$('delay').onchange=e=>{ EXTRA=+e.target.value; };
+$('holdB').onclick=()=>{ HOLD=!HOLD; $('holdB').textContent='Segurar bola: '+(HOLD?'sim':'não'); };
+$('repB').onclick=()=>{ $('repT').value=report(); $('rep').style.display='flex'; };
+$('repX').onclick=()=>{ $('rep').style.display='none'; };
+$('repC').onclick=()=>{ const t=$('repT'); t.select(); try{ navigator.clipboard.writeText(t.value); }catch(_){ document.execCommand('copy'); } $('repC').textContent='Copiado!'; };
+
+/* ---------- sons ---------- */
+let AC=null; function aud(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(_){} } }
+function tone(f,d,v){ if(!AC) return; const o=AC.createOscillator(), g=AC.createGain(); o.frequency.value=f; g.gain.setValueAtTime(v,AC.currentTime); g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+d); o.connect(g).connect(AC.destination); o.start(); o.stop(AC.currentTime+d); }
+function hitSnd(){ tone(900,.05,.2); } function ptSnd(win){ tone(win?660:220,.18,.15); }
+
+/* ---------- sala ---------- */
+function begin(role,code){ ROLE=role; ME=role==='host'?1:-1; OPP=-ME; PAD.x=PAD.tx=ME*1.6; aud();
+  if(LOCAL) localNet(code); else onlineNet(code); requestAnimationFrame(loop); }
+$('mk').onclick=()=>{ const c=String(Math.floor(1000+Math.random()*9000)); $('code').value=c; stMsg('Conectando…'); begin('host',c); };
+$('join').onclick=()=>{ const c=$('code').value.trim(); if(!/^\d{4}$/.test(c)) return stMsg('Digite os 4 números da sala.'); stMsg('Conectando…'); begin('guest',c); };
+const auto=/(host|guest)=(\d{4})/.exec(HASH); if(auto) begin(auto[1],auto[2]);
+window.__lat={LOG,ST,STATS,report,get TRAJ(){return TRAJ;},PAD,setExtra:v=>EXTRA=v};
+})();
+</script></body></html>
