@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SmashPong · Teste da nuvem</title>
+<style>
+:root{--bg:#1b1430;--card:#261d44;--tx:#f4f7fb;--ac:#ffd34d;--ok:#5be38a;--bad:#ff6b6b;--mut:#b9b2d6}
+html,body{margin:0;background:var(--bg);color:var(--tx);font:15px system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:22px;color:var(--ac);margin:4px 0 6px}
+p{color:var(--mut);margin:0 0 12px;line-height:1.4}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+button{font:600 15px system-ui;color:var(--tx);background:#3a2c66;border:0;border-radius:10px;padding:10px 14px}
+button.main{background:#e2463f}
+#who{background:var(--card);border-radius:12px;padding:10px 12px;font-size:14px}
+#log{list-style:none;padding:0;margin:12px 0}
+#log li{background:var(--card);border-radius:10px;padding:9px 12px;margin:6px 0;line-height:1.35}
+#log li b{display:block}
+#log li small{color:var(--mut);word-break:break-all}
+.ok b{color:var(--ok)} .bad b{color:var(--bad)} .run b{color:var(--ac)}
+</style></head><body><main>
+<h1>Teste da nuvem do SmashPong</h1>
+<p>Cria uma conta automática (sem login), grava um save de teste no servidor, lê de volta e confere se ninguém consegue mexer no save de outro jogador.</p>
+<div id="who">Conta: …</div>
+<div class="btns">
+  <button class="main" id="all">Rodar tudo</button>
+  <button id="bSave">Salvar teste</button>
+  <button id="bLoad">Carregar da nuvem</button>
+  <button id="bGame">Enviar meu save do jogo</button>
+  <button id="bNew">Simular celular novo</button>
+</div>
+<ul id="log"></ul>
+<div class="btns"><button id="bCopy">Copiar resultado</button></div>
+</main>
+<script>
+(function(){
+'use strict';
+/* ===== NUVEM (03/11): cliente mínimo do Supabase, sem bibliotecas =====
+   Conta anônima (POST /auth/v1/signup sem e-mail), renovação pelo refresh_token, save em public.saves (um por jogador, RLS).
+   Feito para ir depois para dentro do jogo do jeito que está. */
+const NUVEM=(function(){
+  const URL='https://crzscenueffjlbhwigog.supabase.co', KEY='sb_publishable_Npxqn01FJRbBWye54BCUBA_cs2Ytz-d', LS='sp-cloud';
+  let S=null; try{ S=JSON.parse(localStorage.getItem(LS)||'null'); }catch(_){}
+  const keep=()=>{ try{ localStorage.setItem(LS,JSON.stringify(S)); }catch(_){} };
+  async function req(path,o={}){
+    const h=Object.assign({apikey:KEY,'Content-Type':'application/json'},o.h||{});
+    if(o.auth!==false&&S&&S.access) h.Authorization='Bearer '+S.access;
+    let r; try{ r=await fetch(URL+path,{method:o.m||'GET',headers:h,body:o.b?JSON.stringify(o.b):undefined}); }
+    catch(e){ return {ok:false,st:0,j:{msg:'sem conexão com o servidor ('+e.message+')'}}; }
+    let j=null; const t=await r.text(); try{ j=t?JSON.parse(t):null; }catch(_){ j={msg:t}; }
+    return {ok:r.ok,st:r.status,j};
+  }
+  const errTxt=r=>{ const j=r.j||{}; return (r.st?'HTTP '+r.st+': ':'')+(j.msg||j.message||j.error_description||j.error||j.hint||JSON.stringify(j)); };
+  function take(j){ S={access:j.access_token,refresh:j.refresh_token,exp:Date.now()/1000+(j.expires_in||3600),uid:j.user&&j.user.id}; keep(); }
+  async function session(){
+    if(S&&S.access&&S.exp>Date.now()/1000+60) return {ok:true,how:'guardada'};
+    if(S&&S.refresh){ const r=await req('/auth/v1/token?grant_type=refresh_token',{m:'POST',auth:false,b:{refresh_token:S.refresh}});
+      if(r.ok){ take(r.j); return {ok:true,how:'renovada'}; } }
+    const r=await req('/auth/v1/signup',{m:'POST',auth:false,b:{data:{}}});
+    if(r.ok&&r.j&&r.j.access_token){ take(r.j); return {ok:true,how:'nova'}; }
+    return {ok:false,err:errTxt(r)};
+  }
+  async function save(data,ver){ const s=await session(); if(!s.ok) return s;
+    const r=await req('/rest/v1/saves?on_conflict=user_id',{m:'POST',h:{Prefer:'resolution=merge-duplicates,return=representation'},b:{user_id:S.uid,data,ver}});
+    return r.ok?{ok:true,row:r.j&&r.j[0]}:{ok:false,err:errTxt(r)}; }
+  async function load(){ const s=await session(); if(!s.ok) return s;
+    const r=await req('/rest/v1/saves?select=data,ver,updated_at&user_id=eq.'+S.uid);
+    return r.ok?{ok:true,row:r.j&&r.j[0]||null}:{ok:false,err:errTxt(r)}; }
+  return {session,save,load,req,errTxt,get uid(){ return S&&S.uid; },forget(){ S=null; try{ localStorage.removeItem(LS); }catch(_){} }};
+})();
+
+/* ---------- página de teste ---------- */
+const $=id=>document.getElementById(id), LOG=[];
+function line(cls,title,det){ const li=document.createElement('li'); li.className=cls; li.innerHTML='<b></b><small></small>';
+  li.firstChild.textContent=title; li.lastChild.textContent=det||''; $('log').appendChild(li); LOG.push((cls==='ok'?'✓ ':cls==='bad'?'✗ ':'· ')+title+(det?' — '+det:'')); li.scrollIntoView({block:'nearest'}); return li; }
+function who(){ $('who').textContent='Conta: '+(NUVEM.uid?NUVEM.uid.slice(0,8)+'…':'nenhuma'); }
+const kb=o=>(new Blob([JSON.stringify(o)]).size/1024).toFixed(1)+' KB';
+
+async function tConta(){ const t0=performance.now(), s=await NUVEM.session(); who();
+  if(s.ok) line('ok','Conta '+(s.how==='nova'?'criada':s.how==='renovada'?'renovada':'já existia'),'id '+NUVEM.uid+' · '+Math.round(performance.now()-t0)+' ms');
+  else line('bad','Não consegui criar a conta',s.err+(/anonymous/i.test(s.err)?' → ligue "Allow anonymous sign-ins" no Supabase (Authentication).':''));
+  return s.ok; }
+let LASTV=0;
+async function tSalvar(){ LASTV=Math.floor(Math.random()*1e6); const data={teste:true,quando:new Date().toISOString(),xp:1234,v:LASTV};
+  const t0=performance.now(), r=await NUVEM.save(data,LASTV);
+  if(r.ok) line('ok','Save de teste gravado na nuvem','marca '+LASTV+' · '+Math.round(performance.now()-t0)+' ms');
+  else line('bad','Não consegui gravar',r.err+(/relation|does not exist|schema cache/i.test(r.err)?' → falta rodar o SQL no Supabase.':''));
+  return r.ok; }
+async function tCarregar(){ const t0=performance.now(), r=await NUVEM.load();
+  if(!r.ok){ line('bad','Não consegui ler',r.err); return false; }
+  if(!r.row){ line('bad','A nuvem não tem save desta conta'); return false; }
+  const okv=!LASTV||r.row.ver===LASTV;
+  line(okv?'ok':'bad',okv?'Save lido de volta e confere':'Save lido, mas é outro','versão '+r.row.ver+' · gravado '+new Date(r.row.updated_at).toLocaleTimeString()+' · '+kb(r.row.data)+' · '+Math.round(performance.now()-t0)+' ms');
+  return okv; }
+async function tSeguranca(){
+  const a=await NUVEM.req('/rest/v1/saves?select=user_id');
+  const n=a.ok&&Array.isArray(a.j)?a.j.length:-1, mine=a.ok&&a.j.every(x=>x.user_id===NUVEM.uid);
+  line(a.ok&&n<=1&&mine?'ok':'bad','Listar todos os saves só mostra o seu',a.ok?n+' linha(s) visível(is)':NUVEM.errTxt(a));
+  const fake='00000000-0000-4000-8000-'+String(Math.floor(Math.random()*1e12)).padStart(12,'0');
+  const b=await NUVEM.req('/rest/v1/saves',{m:'POST',b:{user_id:fake,data:{hack:true},ver:1}});
+  line(!b.ok?'ok':'bad','Gravar no save de outra pessoa é recusado',!b.ok?NUVEM.errTxt(b):'ATENÇÃO: o servidor aceitou!');
+  const c=await NUVEM.req('/rest/v1/saves?select=user_id',{auth:false});
+  const open=c.ok&&Array.isArray(c.j)&&c.j.length>0;
+  line(!open?'ok':'bad','Sem conta não se lê nada',c.ok?(c.j.length+' linha(s)'):NUVEM.errTxt(c));
+}
+async function tJogo(){ let raw=null; try{ raw=localStorage.getItem('pp-lateral'); }catch(_){}
+  if(!raw){ line('bad','Não achei save do jogo neste navegador','abra o jogo pelo site (lorenzosilvacosta.github.io/SmashPong) neste mesmo navegador, jogue um pouco e volte'); return; }
+  let data; try{ data=JSON.parse(raw); }catch(_){ line('bad','Save do jogo ilegível'); return; }
+  if(!(await NUVEM.session()).ok) return;
+  LASTV=Math.floor(Math.random()*1e6); const t0=performance.now(), r=await NUVEM.save({jogo:data,quando:new Date().toISOString()},LASTV);
+  line(r.ok?'ok':'bad',r.ok?'Save do jogo enviado (só uma cópia; o jogo não muda)':'Não consegui enviar o save do jogo',(r.ok?kb(data)+' · '+Math.round(performance.now()-t0)+' ms':r.err));
+  if(r.ok) await tCarregar(); }
+
+async function all(){ $('log').innerHTML=''; LOG.length=0; const ln=line('run','Rodando…');
+  if(await tConta()&&await tSalvar()){ await tCarregar(); await tSeguranca(); }
+  ln.remove(); line('run','Fim do teste',new Date().toLocaleString()); }
+$('all').onclick=all;
+$('bSave').onclick=async()=>{ if(await tConta()) await tSalvar(); };
+$('bLoad').onclick=async()=>{ if(await tConta()) await tCarregar(); };
+$('bGame').onclick=tJogo;
+$('bNew').onclick=async()=>{ const old=NUVEM.uid; NUVEM.forget(); who(); line('run','Esqueci a conta deste aparelho (como num celular novo)',old?'conta antiga '+old.slice(0,8)+'…':'');
+  if(await tConta()){ const r=await NUVEM.load(); line('run',r.ok&&!r.row?'A conta nova começa vazia: o save antigo não volta sozinho':'Resultado: '+(r.ok?'tem save':r.err),'é por isso que depois vamos deixar vincular a conta a um e-mail ou ao Google'); } };
+$('bCopy').onclick=()=>{ const t=LOG.join('\n')+'\n'+navigator.userAgent; try{ navigator.clipboard.writeText(t); $('bCopy').textContent='Copiado!'; }catch(_){ prompt('Copie:',t); } };
+who(); window.__nuvem={NUVEM,all,LOG};
+if(/auto/.test(location.hash)) all();
+})();
+</script></body></html>
