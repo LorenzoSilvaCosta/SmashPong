@@ -69,7 +69,7 @@ let VOFF={x:0,y:0};                 /* deslocamento visual que some (troca de tr
 let EXTRA=0;                        /* atraso artificial (ms) */
 const PAD={x:1.6,y:1.05,tx:1.6,ty:1.05,vx:0,vy:0};
 const OPAD={buf:[],x:-1.6,y:1.05};
-const STATS={rtt:[],lat:[],hold:[],jump:[],hits:0,pts:0,via:'-',t0:0};
+const STATS={rx:0,last:'',rtt:[],lat:[],hold:[],jump:[],hits:0,pts:0,via:'-',t0:0};
 let RES=null; const LOG=[]; const lg=s=>{ LOG.push((T()).toFixed(2)+' '+s); if(LOG.length>200) LOG.shift(); };                       /* resultado da jogada atual já decidido */
 
 /* ---------- física determinística ---------- */
@@ -90,14 +90,16 @@ let SEND=()=>{};
 function send(o){ const f=()=>SEND(o); if(EXTRA>0) setTimeout(f,EXTRA); else f(); }
 
 function onMsg(m){
-  if(!m||!m.type) return;
+  if(!m||!m.type) return; STATS.rx++; STATS.last=m.type;
+  if(ROLE==='host'&&ST.phase==='wait'&&(m.type==='hello'||m.type==='ping')){ startGame(); send({type:'start'}); }
+  if(m.type==='start'&&ROLE==='guest'&&ST.phase==='wait'){ ST.phase='serve'; ST.server=1; return; }
   if(m.type==='ping'){ send({type:'pong',t0:m.t0,th:NOW()}); if(m.rtt) pushRtt(m.rtt); return; }
   if(m.type==='pong'){ const t2=NOW(), rtt=t2-m.t0; SYNC.push({rtt,off:m.th-(m.t0+t2)/2}); if(SYNC.length>20) SYNC.shift();
     let best=SYNC[0]; for(const s of SYNC) if(s.rtt<best.rtt) best=s; OFF=best.off; pushRtt(rtt); LASTRTT=rtt; return; }
   if(m.type==='pad'){ OPAD.buf.push(m); if(OPAD.buf.length>40) OPAD.buf.shift(); return; }
   if(m.type==='hit'){ if(m.n<=HITN) return; remoteHit(m); return; }
   if(m.type==='pt'){ if(m.r<ST.rally) return; applyPoint(m.w,m.r,m.s); return; }
-  if(m.type==='hello'&&ROLE==='host'){ startGame(); return; }
+  if(m.type==='hello'){ if(ROLE==='host'&&ST.phase!=='wait') send({type:'start'}); return; }
 }
 let LASTRTT=0;
 function pushRtt(r){ STATS.rtt.push(r*1000); if(STATS.rtt.length>400) STATS.rtt.shift(); }
@@ -133,14 +135,15 @@ function onlineNet(code){
   const sig=o=>{ o.k=Math.random().toString(36).slice(2,10); mq.forEach(c=>c.send(other,o)); };
   const gotSig=async m=>{ if(m.k){ if(seen.has(m.k)) return; seen.add(m.k); }
     if(m.relay){ onMsg(m.relay); return; }
-    if(m.type==='hi'&&ROLE==='host'){ if(pc) return; makePc(true); }
+    if(m.type==='hi'&&ROLE==='host'){ if(pc||/nortc/.test(HASH)) return; makePc(true); }
     else if(m.type==='sdp'){ if(!pc) makePc(false); await pc.setRemoteDescription(m.sdp);
       if(m.sdp.type==='offer'){ await pc.setLocalDescription(await pc.createAnswer()); await gathered(); sig({type:'sdp',sdp:pc.localDescription}); } } };
   const gathered=()=>new Promise(r=>{ if(pc.iceGatheringState==='complete') return r(); const to=setTimeout(r,2500); pc.addEventListener('icegatheringstatechange',()=>{ if(pc.iceGatheringState==='complete'){ clearTimeout(to); r(); } }); });
   const CH={};  /* 'rel' confiável (batidas, pontos, relógio) e 'fast' sem reenvio (posição da raquete) */
-  function wire(c){ c.onopen=()=>{ CH[c.label]=c; if(rtcOk||!CH.rel||!CH.fast) return; rtcOk=true;
+  function wire(c){ c.onopen=()=>{ if(CH[c.label]===c&&rtcOk) return; CH[c.label]=c; if(rtcOk||!CH.rel||!CH.fast) return; rtcOk=true;
       SEND=o=>{ const k=o.type==='pad'?CH.fast:CH.rel; try{ k.send(JSON.stringify(o)); }catch(_){} }; viaCheck(); ready(); };
-    c.onmessage=e=>{ let m; try{ m=JSON.parse(e.data); }catch(_){ return; } onMsg(m); }; }
+    c.onmessage=e=>{ let m; try{ m=JSON.parse(e.data); }catch(_){ return; } onMsg(m); };
+    if(c.readyState==='open') c.onopen(); }  /* no convidado o canal pode já chegar aberto: aí o onopen não dispara */
   function makePc(host){ pc=new RTCPeerConnection({iceServers:ICE});
     if(host){ wire(pc.createDataChannel('rel',{ordered:true})); wire(pc.createDataChannel('fast',{ordered:false,maxRetransmits:0})); pc.createOffer().then(o=>pc.setLocalDescription(o)).then(gathered).then(()=>sig({type:'sdp',sdp:pc.localDescription})); }
     else pc.ondatachannel=e=>wire(e.channel); }
@@ -155,7 +158,7 @@ function onlineNet(code){
   else BROKERS.forEach(u=>{ const c=mqttOpen(u,me,{open(){ if(++opened===1){ stMsg(ROLE==='host'?'Sala '+code+' criada. Esperando o outro aparelho…':'Procurando a sala '+code+'…'); if(ROLE==='guest') hiLoop(); } },msg:gotSig}); mq.push(c); });
   function hiLoop(){ let n=0; const iv=setInterval(()=>{ if(rtcOk||relayOn||n++>40){ clearInterval(iv); return; } sig({type:'hi'}); },700); }
   setTimeout(()=>{ if(rtcOk) return; relayOn=true; STATS.via='servidor MQTT (sem P2P)';
-    SEND=o=>sig({relay:o}); stMsg('Conexão direta falhou; usando o servidor.'); if(ROLE==='guest') send({type:'hello'}); ready(); },15000);
+    SEND=o=>sig({relay:o}); stMsg('Conexão direta falhou; usando o servidor.'); if(ROLE==='guest') send({type:'hello'}); ready(); },10000);
   setTimeout(()=>{ if(!opened) stMsg('Não consegui falar com os servidores. Verifique a internet.'); },8000);
 }
 
@@ -163,7 +166,7 @@ function onlineNet(code){
 let READY=false;
 function ready(){ if(READY) return; READY=true; $('lobby').classList.add('hidden'); $('hud').classList.remove('hidden'); $('tools').classList.remove('hidden');
   STATS.t0=NOW(); setInterval(()=>{ if(ROLE==='guest') send({type:'ping',t0:NOW(),rtt:LASTRTT}); },ROLE==='guest'?500:1e9);
-  if(ROLE==='host'){ setInterval(()=>{},1000); } else { setTimeout(()=>send({type:'hello'}),900); } }
+  if(ROLE==='guest'){ const iv=setInterval(()=>{ if(ST.phase!=='wait') return clearInterval(iv); send({type:'hello'}); },700); } }  /* repete o 'oi' até o anfitrião responder */
 function startGame(){ if(ST.phase!=='wait') return; ST.phase='serve'; ST.srvAt=T()+1.5; }
 function stMsg(s){ $('st').textContent=s; }
 
@@ -238,7 +241,7 @@ function draw(now){
   if(b){ const X=sx(b.x+VOFF.x), Y=sy(b.y+VOFF.y);
     cx.fillStyle='rgba(0,0,0,.35)'; cx.beginPath(); cx.ellipse(X,sy(b.y>TY&&Math.abs(b.x)<TL?TY:0),6,2,0,0,7); cx.fill();
     cx.fillStyle='#fff6e6'; cx.beginPath(); cx.arc(X,Y,Math.max(5,BR*S*1.6),0,7); cx.fill(); }
-  if(ST.phase==='wait'){ txt('Esperando o outro jogador…',W/2,H*.35); }
+  if(ST.phase==='wait'){ txt('Esperando o outro jogador…',W/2,H*.35); cx.font='13px system-ui'; cx.fillStyle='#bbb'; cx.fillText('conexão: '+STATS.via+' · recebidas: '+STATS.rx+(STATS.last?' ('+STATS.last+')':''),W/2,H*.35+24); }
   else if(ST.phase==='serve'&&ST.server===ME){ txt('Seu saque',W/2,H*.3); }
 }
 function pad(x,y,c){ cx.fillStyle=c; cx.beginPath(); cx.ellipse(sx(x),sy(y),.09*S,.11*S,0,0,7); cx.fill(); cx.fillStyle='#4a2f22'; cx.fillRect(sx(x)-3,sy(y)+.1*S,6,.12*S); }
